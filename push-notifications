@@ -1,0 +1,612 @@
+#!/usr/bin/env perl
+#
+#
+# WARNING:  The NotifyMyAndroid notification has NOT been tested as I do not have
+#           an android device.  Please let me know if you try it and whether or not
+#           not it works (I expect it to work as it looks like a clone of prowl.com).
+#
+#
+# push-notifications
+#
+# This program is designed to send icinga/nagios push notifications to admins through
+# various platforms.  Currently NotifyMyAndroid, Prowl and Pushover are supported.
+#
+# This program was originally called nagios-prowl.  When modifying nagios-prowl to
+# allow other platforms, we decided to pick a more generic name.
+#
+# Authors: Dave Alden <dave@alden.name> and Jeff Walter
+#
+# Version History:
+#
+# 0.9 - Dave Alden <dave@alden.name> and Jeff Walter - 2013-12-28
+#    project renamed to push-notifications
+#
+# 0.02 - Jeff Walter - 2012-10-12
+#    Initial release of nagios-prowl
+#
+use warnings;
+use strict;
+
+use Getopt::Long qw/:config no_ignore_case/;
+use LWP::UserAgent;
+use POSIX qw/strftime/;
+use URI::Escape qw/uri_escape/;
+
+# How to format the url that is sent.  Most icinga/nagios apps work with the "full"
+# style.  Nagify requires the "short" style.
+#
+my %urls = (
+            full =>  {
+                      hostformat => '%s/status.cgi?host=%s',
+                      hostarguments => [ 'urlbase', 'hostname' ],
+                      serviceformat => '%s/extinfo.cgi?type=2&host=%s&service=%s',
+                      servicearguments => [ 'urlbase', 'hostname', 'servicedisplayname' ],
+                     },
+            short => {
+                      hostformat => '%s/%s',
+                      hostarguments => [ 'urlbase', 'hostname' ],
+                      serviceformat => '%s/%s/%s',
+                      servicearguments => [ 'urlbase', 'hostname', 'servicedisplayname' ],
+                     },
+           );
+
+# The various platforms that we work with.  Currently they consist of:
+#   nma - http://www.notifymyandroid.com/ - android only
+#   prowl - http://www.prowlapp.com/ - iOS only
+#   pushover - https://pushover.net - both android and iOS
+#
+my %platforms = (
+                 nma =>      {
+                              fn => \&platform_nma,
+                              clientKeyLength => 48,
+                              clientKeyRequired => 1,
+                              developerKeyLength => 48,
+                              developerKeyRequired => 0,
+                              validClientCharacters => '[A-Fa-f0-9]',
+                              validDeveloperCharacters => '[A-Fa-f0-9]',
+                              priority => {
+                                           '0' => '^(ok|unknown|up)$',
+                                           '1' => '^warning$',
+                                           '2' => '^(critical|down)$',
+                                          },
+                              defaultPriority => 1,
+                             },
+                 prowl =>    {
+                              fn => \&platform_prowl,
+                              clientKeyLength => 40,
+                              clientKeyRequired => 1,
+                              developerKeyLength => 40,
+                              developerKeyRequired => 0,
+                              validClientCharacters => '[A-Fa-f0-9]',
+                              validDeveloperCharacters => '[A-Fa-f0-9]',
+                              priority => {
+                                           '0' => '^(ok|unknown|up)$',
+                                           '1' => '^warning$',
+                                           '2' => '^(critical|down)$',
+                                          },
+                              defaultPriority => 1,
+                             },
+                 pushover => {
+                             fn => \&platform_pushover,
+                              clientKeyLength => 30,
+                              clientKeyRequired => 1,
+                              developerKeyLength => 30,
+                              developerKeyRequired => 1,
+                              validClientCharacters => '[A-Za-z0-9]',
+                              validDeveloperCharacters => '[A-Za-z0-9]',
+                              priority => {
+                                           '0' => '^(ok|unknown|up)$',
+                                           '0' => '^warning$',
+                                           '1' => '^(critical|down)$',
+                                          },
+                              defaultPriority => 1,
+                             },
+                );
+
+my %options = (
+               'application'        => 'Icinga',
+               'clientkeys'         => undef,
+               'clientkeyfiles'     => undef,
+               'developerkey'       => undef,
+               'developerkeyfile'   => undef,
+               'help'               => undef,
+               'hostalias'          => undef,
+               'hostname'           => undef,
+               'time'               => time(),
+               'notification'       => undef,
+               'output'             => undef,
+               'platform'           => 'prowl',
+               'state'              => undef,
+               'servicedesc'        => undef,
+               'servicedisplayname' => undef,
+               'urlbase'            => 'https://localhost/nagios/cgi-bin',
+               'urltype'            => 'full',
+               'verbose'            => 0,
+              );
+
+GetOptions (
+            'application|a=s'        => \$options{'application'},
+            'clientkey|c=s@'         => \$options{'clientkeys'},
+            'clientkeyfile|C=s@'     => \$options{'clientkeyfiles'},
+            'developerkey|d=s'       => \$options{'developerkey'},
+            'developerkeyfile|D=s'   => \$options{'developerkeyfile'},
+            'help|h'                 => \$options{'help'},
+            'hostalias|A=s'          => \$options{'hostalias'},
+            'hostname|H=s'           => \$options{'hostname'},
+            'notication|n=s'         => \$options{'notification'},
+            'output|o=s'             => \$options{'output'},
+            'platform|p=s'           => \$options{'platform'},
+            'state|s=s'              => \$options{'state'},
+            'servicedesc|S=s'        => \$options{'servicedesc'},
+            'servicedisplayname|N=s' => \$options{'servicedisplayname'},
+            'time|t=s'               => \$options{'time'},
+            'urlbase|u=s'            => \$options{'urlbase'},
+            'urltype|U=s'            => \$options{'urltype'},
+            'verbose|v'              => \$options{'verbose'},
+           );
+
+checkOptions(\%options, \%platforms, \%urls);
+
+my %platform = %{$platforms{$options{'platform'}}};
+
+my @clientkeys = getKeys("client", $platform{clientKeyRequired}, $platform{validClientCharacters},
+                      $options{'clientkeys'}, $options{'clientkeyfiles'});
+
+my ($developerkey) = getKeys("developer", $platform{developerkeyRequired},
+                          $platform{validDeveloperCharacters}, $options{'developerkey'},
+                          $options{'developerkeyfile'});
+
+my %notification = createNotification(\%options, \%platform, \%{$urls{$options{'urltype'}}},
+                                      \@clientkeys, $developerkey);
+
+$platform{'fn'}->(\%options, \%notification);
+
+exit (0);
+
+
+#
+sub checkOptions {
+
+  my ($options, $platforms, $urls) = @_;
+
+  if (defined ($options{'help'})) {
+
+    usage (0);
+
+  } elsif (! defined ($options{'hostname'}) || ! length ($options{'hostname'})) {
+
+    print "Error: must specify --hostname\n\n";
+    usage(1);
+
+  } elsif (! defined ($options{'output'}) || ! length ($options{'output'})) {
+
+    print "Error: must specify --output\n\n";
+    usage(1);
+
+  } elsif (! defined ($options{'servicedesc'}) || ! length ($options{'servicedesc'})) {
+
+    print "Error: must specify -servicedesc\n\n";
+    usage(1);
+
+  } elsif (! defined ($options{'state'}) || ! length ($options{'state'})) {
+
+    print "Error: must specify -state\n\n";
+    usage(1);
+  }
+
+  validateChoice('platform', $platforms, $options{'platform'});
+  validateChoice('urltype', $urls, $options{'urltype'});
+
+  if (defined($options{'hostname'}) && ! defined($options{'hostalias'})) {
+
+    $options{'hostalias'} = $options{'hostname'};
+  }
+
+  if (defined($options{'servicedesc'}) && ! defined($options{'servicedisplayname'})) {
+
+    $options{'servicedisplayname'} = $options{'servicedesc'};
+  }
+
+  return;
+}
+
+
+#
+sub createNotification {
+
+  my ($options, $platform, $url, $clientkeys, $developerkey) = @_;
+
+  my %notification = ();
+
+  # The notification client keys
+    $notification{'clientkeys'} = \@{$clientkeys};
+
+  # The notification developer key
+    $notification{'developerkey'} = $developerkey;
+
+  # Create the notification "priority" (based the state)
+  while( my ($priority, $regex) = each(%{$platform->{priority}})) {
+
+    if ($options{'state'} =~ /$regex/i) {
+      $notification{priority} = $priority;
+      last;
+    }
+  }
+
+  if (!defined($notification{priority})) {
+
+    printf (STDERR "Warning: State \"%s\" cannot be translated to a priority, using default priority %s\n", $options{'state'}, $platform->{defaultPriority});
+    $notification{priority} = $platform->{defaultPriority};
+  }
+
+  # Create the notification "body"
+  $notification{body} = $options{'output'};
+
+  # Create the notification "application"
+  $notification{application} = $options{'application'};
+
+  # Create the notification "time"
+  $notification{time} = $options{'time'};
+
+  # Create the notification "title"
+  $notification{title} = sprintf('%s:%s', $options{'notification'}, $options{'hostalias'});
+
+  if (defined($options{'servicedisplayname'})) {
+
+    $notification{title} .= sprintf('/%s', $options{'servicedisplayname'});
+  }
+
+  $notification{title} .= sprintf(' is %s', $options{'state'});
+
+  # Create the notification "url"
+  my @args;
+
+  if (defined ($options{'servicedesc'})) {
+
+    foreach my $arg (@{$url->{servicearguments}}) {
+
+      if ($arg eq 'servicedesc') {
+
+        push(@args, uri_escape($options{$arg}));
+
+      } else {
+
+        push(@args, $options{$arg});
+      }
+    }
+
+    $notification{url} = sprintf($url->{serviceformat}, @args);
+
+  } else {
+
+    foreach my $arg (@{$url->{hostarguments}}) {
+
+      push(@args, $options{$arg});
+    }
+
+    $notification{url} = sprintf($url->{hostformat}, @args);
+  }
+
+  return %notification;
+}
+
+
+#
+sub getKeys {
+
+  my ($keytype, $keyRequired, $validCharacters, $keysin, $keyfilesin) = @_;
+
+  my @keys = ();
+
+  if (defined($keysin)) {
+    if (ref($keysin)) {
+      @keys = split(/,/, join(',', @$keysin));
+    } else {
+      @keys = ( $keysin );
+    }
+  }
+
+  #
+  if (defined($keyfilesin)) {
+
+    my @keyfiles;
+
+    if (ref($keyfilesin)) {
+      @keyfiles = split(/,/, join(',', @$keyfilesin));
+    } else {
+      @keyfiles = ( $keyfilesin );
+    }
+
+    # Load  keys from files (one per line to keep it simple)
+
+    foreach my $file (@keyfiles) {
+
+      if (! open (FILE, '<', $file)) {
+
+        printf (STDERR "Warning: Could not open \"%s\": %s\n", $file, $!);
+        next;
+      }
+
+      while (my $key = <FILE>) {
+
+        $key =~ s/(\r\n?|\n)$//sm;
+
+        if (grep $_ eq $key, @keys) {
+
+          printf (STDERR "Warning: Duplicate $keytype key from %s: \"%s\"\n", $file, $key);
+          next;
+        }
+
+        push (@keys, $key);
+      }
+
+      close (FILE);
+    }
+  }
+
+
+  # Normalize  keys
+
+  for (my $i = 0; $i <= $#keys; $i++) {
+
+    my $key = lc ($keys[$i]);
+
+    if ( ! length ($key) || ($key !~ /$validCharacters/)) {
+
+      printf (STDERR "Warning: Ignoring invalid $keytype key \"%s\"\n", $keys[$i]);
+      splice (@keys, $i, 1);
+      $i--;
+      next;
+    }
+
+    if (scalar (grep { $_ eq $key } @keys) > 1) {
+
+      printf (STDERR "Warning: Duplicate $keytype key \"%s\"\n", $key);
+      splice (@keys, $i, 1);
+      $i--;
+      next;
+    }
+  }
+
+  if ($keyRequired && $#keys < 0) {
+
+    print "Error: no (valid) $keytype keys specficied\n";
+    usage(1);
+  }
+
+  return @keys;
+}
+
+
+#
+sub usage {
+  my ($exitcode) = @_;
+
+  printf (<<'EOS', $0);
+Usage: %s [options]
+
+Options (* means it is required):
+  --application (-a)        Name of the Icinga/Nagios instance (default: Icinga)
+* --clientkey (-c)          API key(s) to send the notification to
+  --clientkeyfile (-C)      File(s) to load API keys from
+  --developerkey (-d)       Developer (aka provider or token) API key
+  --developerkeyfile (-D)   File to load developer API key from
+  --help (-h)               This help
+  --hostalias (-A)          Alias for the hostname
+* --hostname (-H)           Hostname for the notification
+* --notification (-N)       Notification type (Problem or Resolved)
+* --output (-o)             Output of the check command
+  --platform (-p)           platform (nma, prowl, or pushover) (default: prowl)
+* --state (-s)              Host/Service state (Up, Down, Unknown, Ok, Warning, or Critical)
+  --servicedesc (-S)        Service description for the notification
+  --servicedisplayname (-N) Displayname for the service
+  --time (-t)               Time the notification was generated (seconds since epoch) (default: now)
+  --urlbase (-u)            Base URL for the cgi-bin (default: https://localhost/nagios/cgi-bin)
+  --urltype (-U)            "short" or "full" (default: full)
+  --verbose (-v)            Display verbose output
+
+EOS
+
+  exit ($exitcode);
+}
+
+
+#
+sub validateChoice {
+
+  my ($type, $validHash, $choice) = @_;
+
+  if ($choice eq '') {
+    return;
+  }
+
+  my $match = 0;
+  my $validChoices = '';
+
+  foreach my $validChoice (keys %{$validHash}) {
+
+    if ($choice eq $validChoice) {
+
+      $match = 1;
+      last;
+    }
+
+    if ($validChoices ne '') {
+
+      $validChoices .= ', ';
+    }
+
+    $validChoices .= $validChoice;
+  }
+
+  if (! $match) {
+
+    printf "Error: Invalid %s \"%s\".  Please choose from: %s\n\n", $type, $choice, $validChoices;
+    usage(1);
+  }
+
+  return;
+}
+
+
+#
+sub platform_nma {
+
+  my ($options, $notification) = @_;
+
+  my ($useragent, $request, $response);
+
+  $useragent = LWP::UserAgent->new('agent' => 'push-notifications/0.9');
+  $useragent->env_proxy ();
+
+  $request = sprintf (
+                      'https://www.notifymyandroid.com/publicapi/notify?apikey=%s&application=%s&event=%s&description=%s&priority=%d%s',
+                      join(',', @{$notification{'clientkeys'}}),
+                      uri_escape($notification{'application'}),
+                      uri_escape($notification{'title'}),
+                      uri_escape(sprintf('Date/Time: %s | Output: %s', strftime ('%a %b %e %H:%M:%S %z %Y', localtime($notification{'time'})), $notification{'body'})),
+                      $notification{'priority'},
+                      (defined ($notification{'developerkey'}) ? '&developerkey=' . $notification{'developerkey'} : ''),
+                      (defined ($notification{'url'}) ? '&url=' . uri_escape($notification{'url'}) : '')
+                     );
+
+  if ($options{'verbose'}) {
+
+    print "Info: Sending the following:\n";
+    print $request . "\n";
+  }
+
+  $response = $useragent->get($request);
+
+  if ($response->code() == 401) {
+
+    print (STDERR "Failed to send notification: unknown API key\n");
+    exit(2);
+
+  } elsif ($response->code() == 402) {
+
+    print (STDERR "Failed to send notification: maximum number of API calls per hour exceeded.\n");
+    exit(2);
+
+  } elsif (! $response->is_success()) {
+
+    printf (STDERR "Failed to send notification: %s\n", $response->content ());
+    exit(2);
+
+  } elsif ($options{'verbose'}) {
+
+    print "Info: success\n";
+  }
+
+  return;
+}
+
+
+#
+sub platform_prowl {
+
+  my ($options, $notification) = @_;
+
+  my ($useragent, $request, $response);
+
+  $useragent = LWP::UserAgent->new('agent' => 'push-notifications/0.9');
+  $useragent->env_proxy ();
+
+  $request = sprintf (
+                      'https://prowlapp.com/publicapi/add?apikey=%s&application=%s&event=%s&description=%s&priority=%d%s%s',
+                      join(',', @{$notification{'clientkeys'}}),
+                      uri_escape($notification{'application'}),
+                      uri_escape($notification{'title'}),
+                      uri_escape(sprintf('Date/Time: %s | Output: %s', strftime ('%a %b %e %H:%M:%S %z %Y', localtime($notification{'time'})), $notification{'body'})),
+                      $notification{'priority'},
+                      (defined ($notification{'developerkey'}) ? '&developerkey=' . $notification{'developerkey'} : ''),
+                      (defined ($notification{'url'}) ? '&url=' . uri_escape($notification{'url'}) : '')
+                     );
+
+  if ($options{'verbose'}) {
+
+    print "Info: Sending the following:\n";
+    print $request . "\n";
+  }
+
+  $response = $useragent->get($request);
+
+  if ($response->code () == 401) {
+
+    print (STDERR "Failed to send notification: unknown API key\n");
+    exit(2);
+
+  } elsif (! $response->is_success()) {
+
+    printf (STDERR "Failed to send notification: %s\n", $response->content ());
+    exit(2);
+
+  } elsif ($options{'verbose'}) {
+
+    print "Info: success\n";
+  }
+
+  return;
+}
+
+
+#
+sub platform_pushover {
+
+  my ($options, $notification) = @_;
+
+  my ($useragent, $request, $response);
+
+  $useragent = LWP::UserAgent->new('agent' => 'push-notifications/0.9');
+  $useragent->env_proxy ();
+
+  foreach my $clientkey (@{$notification{'clientkeys'}}) {
+
+    if ($options{'verbose'}) {
+
+      print "Info: Posting the following to https://api.pushover.net/1/messages.json:\n";
+      print "  'token'     => $notification{'developerkey'}\n";
+      print "  'user'      => $clientkey\n";
+      print "  'message'   => $notification{'body'}\n";
+      print "  'url'       => $notification{'url'}\n";
+      print "  'title'     => $notification{'title'}\n";
+      print "  'priority'  => $notification{'priority'}\n";
+      print "  'timestamp' => $notification{'time'}\n";
+    }
+
+    $response = $useragent->post(
+                                 'https://api.pushover.net/1/messages.json',
+                                 [
+                                  'token'     => $notification{'developerkey'},
+                                  'user'      => $clientkey,
+                                  'message'   => $notification{'body'},
+                                  'url'       => $notification{'url'},
+                                  'title'     => $notification{'title'},
+                                  'priority'  => $notification{'priority'},
+                                  'timestamp' => $notification{'time'},
+                                 ]);
+
+    if ($response->code() == 400) {
+
+      print (STDERR "Failed to send notification:  Incorrect user or application key\n");
+      print $response->content;
+      exit(2);
+
+    } elsif ($response->code() == 429) {
+
+      print (STDERR "Failed to send notification: Application is over API limit\n");
+      exit(3)
+
+    } elsif (! $response->is_success()) {
+
+      printf (STDERR "Failed to send notification: %s\n", $response->content());
+      exit(4);
+
+    } elsif ($options{'verbose'}) {
+
+      print "Info: success\n";
+    }
+  }
+
+  return;
+}
