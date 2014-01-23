@@ -9,9 +9,11 @@ us know if you try it.
 
 More info on the various push notification services is available from:
 
-  nma - http://www.notifymyandroid.com/ - android only
-  prowl - http://www.prowlapp.com/ - iOS only
-  pushover - https://pushover.net - both android and iOS
+<ul>
+  <li>nma - http://www.notifymyandroid.com/ - android only</li>
+  <li>prowl - http://www.prowlapp.com/ - iOS only</li>
+  <li>pushover - https://pushover.net - both android and iOS</li>
+</ul>
 
 I've included example_commands.cfg and example_contacts.cfg as examples
 of how to use this script.
